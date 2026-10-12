@@ -110,6 +110,13 @@ final class OtherReport
     private $expense_class_term_ids_cache = [];
 
     /**
+     * 每張 receipt 對應的單據與單據日期的暫存（同一次請求內共用），見 get_receipt_source_notes()
+     *
+     * @var array<int, array{note: \WP_Post, is_credit_note: bool, timestamp: int}>|null
+     */
+    private $receipt_source_notes_cache = null;
+
+    /**
      * 取得指定 expense_class slug 對應的 term ID（查一次記起來）
      *
      * @param array<string> $slugs
@@ -1733,6 +1740,8 @@ final class OtherReport
      * 計算指定 insurer（通過 post_name）的 Insurer Payment 總金額
      * 從所有 receipts 中判斷是 debitNote/creditNote/renewal，然後進行 get_insurer_payment 之後將金額加總
      *
+     * 期間依「對應單據的日期」判斷，而不是 receipt 自己的收款日
+     *
      * @param string|null $start_date
      * @param string|null $end_date
      * @param string $insurer_post_name insurer 的 post_name（例如 'msig-insurance-hong-kong-ltd'）
@@ -1740,175 +1749,119 @@ final class OtherReport
      */
     private function calculate_insurer_payment_total_by_post_name($start_date, $end_date, $insurer_post_name)
     {
-        // 首先找到對應的 insurer
-        $insurer_args = [
+        $insurers = get_posts([
             'post_type' => 'insurers',
             'posts_per_page' => 1,
             'name' => $insurer_post_name, // 使用 post_name 查找
-        ];
-        
-        $insurer_query = new \WP_Query($insurer_args);
-        $insurer = null;
-        
-        if ($insurer_query->have_posts()) {
-            $insurer_query->the_post();
-            $insurer = $insurer_query->post;
-        }
-        wp_reset_postdata();
-        
-        if (!$insurer) {
+        ]);
+        if (empty($insurers)) {
             return 0;
         }
-        
-        $insurer_id = $insurer->ID;
-        
-        // 查詢期間內的 receipts
-        $receipts_args = [
-            'post_type' => 'receipts',
-            'posts_per_page' => -1,
-        ];
-        
+        $insurer = $insurers[0];
+
+        $start_timestamp = null;
+        $end_timestamp = null;
         if ($start_date && $end_date) {
             $wp_timezone = wp_timezone();
-            $start_datetime = new \DateTime($start_date . ' 00:00:00', $wp_timezone);
-            $end_datetime = new \DateTime($end_date . ' 23:59:59', $wp_timezone);
-            $start_timestamp = $start_datetime->getTimestamp();
-            $end_timestamp = $end_datetime->getTimestamp();
-            
-            $receipts_args['meta_query'] = [
-                [
-                    'key' => 'date',
-                    'value' => [$start_timestamp, $end_timestamp],
-                    'compare' => 'BETWEEN',
-                    'type' => 'NUMERIC',
-                ],
-            ];
+            $start_timestamp = (new \DateTime($start_date . ' 00:00:00', $wp_timezone))->getTimestamp();
+            $end_timestamp = (new \DateTime($end_date . ' 23:59:59', $wp_timezone))->getTimestamp();
         }
-        
-        $receipts_query = new \WP_Query($receipts_args);
+
         $total = 0;
-        
-        if ($receipts_query->have_posts()) {
-            // 收集所有需要的 note IDs
-            $debit_note_ids = [];
-            $credit_note_ids = [];
-            $renewal_ids = [];
-            
-            while ($receipts_query->have_posts()) {
-                $receipts_query->the_post();
-                $receipt_id = get_the_ID();
-                
-                $debit_note_id = get_post_meta($receipt_id, 'debit_note_id', true);
-                $credit_note_id = get_post_meta($receipt_id, 'created_from_credit_note_id', true);
-                $renewal_id = get_post_meta($receipt_id, 'created_from_renewal_id', true);
-                
-                if ($debit_note_id) {
-                    $debit_note_ids[] = $debit_note_id;
-                }
-                if ($credit_note_id) {
-                    $credit_note_ids[] = $credit_note_id;
-                }
-                if ($renewal_id) {
-                    $renewal_ids[] = $renewal_id;
-                }
+        foreach ($this->get_receipt_source_notes() as ['note' => $the_note, 'is_credit_note' => $is_credit_note, 'timestamp' => $note_timestamp]) {
+            if (null !== $start_timestamp && ($note_timestamp < $start_timestamp || $note_timestamp > $end_timestamp)) {
+                continue;
             }
-            wp_reset_postdata();
-            
-            // 一次性查詢所有相關的 notes
-            $debit_notes_map = [];
-            $credit_notes_map = [];
-            $renewals_map = [];
-            
-            if (!empty($debit_note_ids)) {
-                $debit_notes_query = new \WP_Query([
-                    'post_type' => 'debit_notes',
-                    'post__in' => array_unique($debit_note_ids),
-                    'posts_per_page' => -1,
-                ]);
-                if ($debit_notes_query->have_posts()) {
-                    while ($debit_notes_query->have_posts()) {
-                        $debit_notes_query->the_post();
-                        $debit_notes_map[get_the_ID()] = $debit_notes_query->post;
-                    }
-                }
-                wp_reset_postdata();
+            if (get_post_meta($the_note->ID, 'insurer_id', true) != $insurer->ID) {
+                continue;
             }
-            
-            if (!empty($credit_note_ids)) {
-                $credit_notes_query = new \WP_Query([
-                    'post_type' => 'credit_notes',
-                    'post__in' => array_unique($credit_note_ids),
-                    'posts_per_page' => -1,
-                ]);
-                if ($credit_notes_query->have_posts()) {
-                    while ($credit_notes_query->have_posts()) {
-                        $credit_notes_query->the_post();
-                        $credit_notes_map[get_the_ID()] = $credit_notes_query->post;
-                    }
-                }
-                wp_reset_postdata();
-            }
-            
-            if (!empty($renewal_ids)) {
-                $renewals_query = new \WP_Query([
-                    'post_type' => 'renewals',
-                    'post__in' => array_unique($renewal_ids),
-                    'posts_per_page' => -1,
-                ]);
-                if ($renewals_query->have_posts()) {
-                    while ($renewals_query->have_posts()) {
-                        $renewals_query->the_post();
-                        $renewals_map[get_the_ID()] = $renewals_query->post;
-                    }
-                }
-                wp_reset_postdata();
-            }
-            
-            // 重新查詢 receipts 並計算
-            $receipts_query = new \WP_Query($receipts_args);
-            if ($receipts_query->have_posts()) {
-                while ($receipts_query->have_posts()) {
-                    $receipts_query->the_post();
-                    $receipt = $receipts_query->post;
-                    
-                    $debit_note_id = get_post_meta($receipt->ID, 'debit_note_id', true);
-                    $credit_note_id = get_post_meta($receipt->ID, 'created_from_credit_note_id', true);
-                    $renewal_id = get_post_meta($receipt->ID, 'created_from_renewal_id', true);
-                    
-                    // 判斷是 debitNote/creditNote/renewal（優先順序：creditNote > renewal > debitNote）
-                    $the_note = null;
-                    $is_credit_note = false;
-                    
-                    if ($credit_note_id && isset($credit_notes_map[$credit_note_id])) {
-                        $the_note = $credit_notes_map[$credit_note_id];
-                        $is_credit_note = true;
-                    } elseif ($renewal_id && isset($renewals_map[$renewal_id])) {
-                        $the_note = $renewals_map[$renewal_id];
-                    } elseif ($debit_note_id && isset($debit_notes_map[$debit_note_id])) {
-                        $the_note = $debit_notes_map[$debit_note_id];
-                    }
-                    
-                    // 檢查 theNote 的 insurer_id 是否匹配
-                    if ($the_note) {
-                        $note_insurer_id = get_post_meta($the_note->ID, 'insurer_id', true);
-                        
-                        if ($note_insurer_id == $insurer_id) {
-                            $insurer_payment = $this->get_insurer_payment($the_note, $insurer);
-                            
-                            // 如果是 creditNote 則減去，否則加上
-                            if ($is_credit_note) {
-                                $total -= $insurer_payment;
-                            } else {
-                                $total += $insurer_payment;
-                            }
-                        }
-                    }
-                }
-            }
-            wp_reset_postdata();
+
+            $insurer_payment = $this->get_insurer_payment($the_note, $insurer);
+            // 如果是 creditNote 則減去，否則加上
+            $total += $is_credit_note ? -$insurer_payment : $insurer_payment;
         }
-        
+
         return round($total, 2, PHP_ROUND_HALF_UP);
+    }
+
+    /**
+     * 取得每張 receipt 對應的單據與單據日期（同一次請求內只查一次）
+     *
+     * 對應單據的優先順序：creditNote > renewal > debitNote，與 Insurer Payment 畫面相同。
+     * 單據沒有 date post meta 時（例如開收據時自動補建的空 debit note）改用 post 發佈日，
+     * 與 Api\Receipts::get_source_note_date_meta_query() 的篩選一致。
+     *
+     * @return array<int, array{note: \WP_Post, is_credit_note: bool, timestamp: int}>
+     */
+    private function get_receipt_source_notes(): array
+    {
+        if (null !== $this->receipt_source_notes_cache) {
+            return $this->receipt_source_notes_cache;
+        }
+
+        $receipt_ids = get_posts([
+            'post_type' => 'receipts',
+            'posts_per_page' => -1,
+            'fields' => 'ids',
+            'no_found_rows' => true,
+        ]);
+
+        $relations = [
+            'created_from_credit_note_id' => 'credit_notes',
+            'created_from_renewal_id' => 'renewals',
+            'debit_note_id' => 'debit_notes',
+        ];
+
+        // 先收集所有需要的 note IDs，再依類型一次查出來
+        $receipt_note_ids = [];
+        $note_ids_by_post_type = array_fill_keys($relations, []);
+        foreach ($receipt_ids as $receipt_id) {
+            foreach ($relations as $meta_key => $post_type) {
+                $note_id = (int) get_post_meta($receipt_id, $meta_key, true);
+                $receipt_note_ids[$receipt_id][$post_type] = $note_id;
+                if ($note_id) {
+                    $note_ids_by_post_type[$post_type][] = $note_id;
+                }
+            }
+        }
+
+        $notes_by_post_type = [];
+        foreach ($note_ids_by_post_type as $post_type => $note_ids) {
+            $notes_by_post_type[$post_type] = [];
+            if (empty($note_ids)) {
+                continue;
+            }
+            $notes = get_posts([
+                'post_type' => $post_type,
+                'post__in' => array_values(array_unique($note_ids)),
+                'posts_per_page' => -1,
+                'no_found_rows' => true,
+            ]);
+            foreach ($notes as $note) {
+                $notes_by_post_type[$post_type][$note->ID] = $note;
+            }
+        }
+
+        $source_notes = [];
+        foreach ($receipt_note_ids as $note_ids) {
+            foreach ($relations as $post_type) {
+                $note_id = $note_ids[$post_type];
+                if (!$note_id || !isset($notes_by_post_type[$post_type][$note_id])) {
+                    continue;
+                }
+                $the_note = $notes_by_post_type[$post_type][$note_id];
+                $note_date = get_post_meta($the_note->ID, 'date', true);
+                $source_notes[] = [
+                    'note' => $the_note,
+                    'is_credit_note' => 'credit_notes' === $post_type,
+                    'timestamp' => '' !== $note_date ? (int) $note_date : (int) get_post_timestamp($the_note),
+                ];
+                break;
+            }
+        }
+
+        $this->receipt_source_notes_cache = $source_notes;
+        return $source_notes;
     }
 
     /**
@@ -2210,7 +2163,7 @@ final class OtherReport
         };
 
         // A/C Payable 各保險公司：借 = 付給保險公司的支出（insurer-payment-* 分類）；
-        // 貸 = 期間內 receipts 對應單據的 insurer payment
+        // 貸 = receipts 對應單據的 insurer payment，期間依單據日期判斷
         $insurers = [
             'A/C Payable - MSIG' => ['insurer-payment-msig', 'msig-insurance-hong-kong-ltd'],
             'A/C Payable - Tokio Marine' => ['insurer-payment-tokio', 'the-tokio-marine-fire-ins-co-hk-ltd'],
